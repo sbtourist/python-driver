@@ -235,8 +235,6 @@ class Column(object):
         """
         Converts python value into database value
         """
-        if value is None and self.has_default:
-            return self.get_default()
         return value
 
     @property
@@ -948,7 +946,16 @@ class Map(BaseContainerColumn):
 class UDTValueManager(BaseValueManager):
     @property
     def changed(self):
-        return self.value != self.previous_value or (self.value is not None and self.value.has_changed_fields())
+        if self.explicit:
+            return self.value != self.previous_value
+
+        default_value = self.column.get_default()
+        if not self.column._val_is_null(default_value):
+            return self.value != default_value
+        elif self.previous_value is None:
+            return not self.column._val_is_null(self.value) and self.value.has_changed_fields()
+
+        return False
 
     def reset_previous_value(self):
         if self.value is not None:
@@ -993,6 +1000,28 @@ class UserDefinedType(Column):
             return
         val.validate()
         return val
+
+    def to_python(self, value):
+        if value is None:
+            return
+
+        copied_value = deepcopy(value)
+        for name, field in self.user_type._fields.items():
+            if copied_value[name] is not None or isinstance(field, BaseContainerColumn):
+                copied_value[name] = field.to_python(copied_value[name])
+
+        return copied_value
+
+    def to_database(self, value):
+        if value is None:
+            return
+
+        copied_value = deepcopy(value)
+        for name, field in self.user_type._fields.items():
+            if copied_value[name] is not None or isinstance(field, BaseContainerColumn):
+                copied_value[name] = field.to_database(copied_value[name])
+
+        return copied_value
 
 def resolve_udts(col_def, out_list):
     for col in col_def.sub_types:

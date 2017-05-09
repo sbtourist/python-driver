@@ -17,6 +17,7 @@ from uuid import uuid4
 from mock import patch
 from cassandra.cqlengine import ValidationError
 
+from tests.integration import greaterthancass21
 from tests.integration.cqlengine.base import BaseCassEngTestCase
 from cassandra.cqlengine.models import Model
 from cassandra.cqlengine import columns
@@ -151,6 +152,7 @@ class UDT(UserType):
     age = columns.Integer()
     mf = columns.Map(columns.Integer, columns.Integer)
     dummy_udt = columns.Integer(default=42)
+    time_col = columns.Time()
 
 
 class ModelWithDefault(Model):
@@ -174,7 +176,7 @@ class ModelWithDefaultCollection(Model):
     udt = columns.UserDefinedType(UDT)
     udt_default = columns.UserDefinedType(UDT, default=UDT(age=1, mf={2: 2}))
 
-
+@greaterthancass21
 class ModelWithDefaultTests(BaseCassEngTestCase):
 
     @classmethod
@@ -183,9 +185,11 @@ class ModelWithDefaultTests(BaseCassEngTestCase):
 
     def setUp(self):
         sync_table(ModelWithDefault)
+        sync_table(ModelWithDefaultCollection)
 
     def tearDown(self):
         drop_table(ModelWithDefault)
+        drop_table(ModelWithDefaultCollection)
 
     def test_value_override_with_default(self):
         """
@@ -309,28 +313,61 @@ class ModelWithDefaultTests(BaseCassEngTestCase):
         udt, udt_default = UDT(age=1, mf={6: 6}), UDT(age=1, mf={6: 6})
 
         item = ModelWithDefaultCollection.create(id=1, mf={1: 1}, dummy=1, udt=udt, udt_default=udt_default).save()
-        self.assertEqual(ModelWithDefaultCollection.all().get()._as_dict(),
+        self.assertEqual(ModelWithDefaultCollection.objects.get(id=1)._as_dict(),
                          {'id': 1, 'dummy': 1, 'mf': {1: 1}, "udt": udt, "udt_default": udt_default})
 
         udt, udt_default = UDT(age=1, mf={5: 5}), UDT(age=1, mf={5: 5})
         item.update(mf={2: 2}, udt=udt, udt_default=udt_default)
-        self.assertEqual(ModelWithDefaultCollection.all().get()._as_dict(),
+        self.assertEqual(ModelWithDefaultCollection.objects.get(id=1)._as_dict(),
                          {'id': 1, 'dummy': 1, 'mf': {2: 2}, "udt": udt, "udt_default": udt_default})
 
         udt, udt_default = UDT(age=1, mf=None), UDT(age=1, mf=None)
         expected_udt, expected_udt_default = UDT(age=1, mf={}), UDT(age=1, mf={})
         item.update(mf=None, udt=udt, udt_default=udt_default)
-        self.assertEqual(ModelWithDefaultCollection.all().get()._as_dict(),
+        self.assertEqual(ModelWithDefaultCollection.objects.get(id=1)._as_dict(),
                          {'id': 1, 'dummy': 1, 'mf': {}, "udt": expected_udt, "udt_default": expected_udt_default})
 
-        udt_default = UDT(age=1, mf=None), UDT(age=1, mf={5:5})
-        item = ModelWithDefaultCollection.create(id=2, dummy=2).save()
-        self.assertEqual(ModelWithDefaultCollection.all().get(id=2)._as_dict(),
+        udt_default = UDT(age=1, mf={2:2}, dummy_udt=42)
+        item = ModelWithDefaultCollection.create(id=2, dummy=2)
+        self.assertEqual(ModelWithDefaultCollection.objects.get(id=2)._as_dict(),
                          {'id': 2, 'dummy': 2, 'mf': {2: 2}, "udt": None, "udt_default": udt_default})
 
         udt, udt_default = UDT(age=1, mf={1: 1, 6: 6}), UDT(age=1, mf={1: 1, 6: 6})
         item.update(mf={1: 1, 4: 4}, udt=udt, udt_default=udt_default)
-        self.assertEqual(ModelWithDefaultCollection.all().get(id=2)._as_dict(),
+        self.assertEqual(ModelWithDefaultCollection.objects.get(id=2)._as_dict(),
                          {'id': 2, 'dummy': 2, 'mf': {1: 1, 4: 4}, "udt": udt, "udt_default": udt_default})
 
-        drop_table(ModelWithDefaultCollection)
+        item.update(udt_default=None)
+        self.assertEqual(ModelWithDefaultCollection.objects.get(id=2)._as_dict(),
+                         {'id': 2, 'dummy': 2, 'mf': {1: 1, 4: 4}, "udt": udt, "udt_default": None})
+
+        udt_default = UDT(age=1, mf={2:2})
+        item.update(udt_default=udt_default)
+        self.assertEqual(ModelWithDefaultCollection.objects.get(id=2)._as_dict(),
+                         {'id': 2, 'dummy': 2, 'mf': {1: 1, 4: 4}, "udt": udt, "udt_default": udt_default})
+
+
+    def test_udt_to_python(self):
+        """
+        Test the to_python and to_database are correctly called on UDTs
+        @since 3.10
+        @jira_ticket PYTHON-743
+        @expected_result the int value is correctly converted to utils.Time
+        and written to C*
+
+        @test_category object_mapper
+        """
+        item = ModelWithDefault(id=1)
+        item.save()
+
+        # We update time_col this way because we want to hit
+        # the to_python method from UserDefinedType, otherwise to_python
+        # would be called in UDT.__init__
+        user_to_update = UDT()
+        user_to_update.time_col = 10
+
+        item.update(udt=user_to_update)
+
+        udt, udt_default = UDT(time_col=10), UDT(age=1, mf={2:2})
+        self.assertEqual(ModelWithDefault.objects.get(id=1)._as_dict(),
+                         {'id': 1, 'dummy': 42, 'mf': {}, "udt": udt, "udt_default": udt_default})
